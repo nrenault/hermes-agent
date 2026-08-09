@@ -1,4 +1,5 @@
 import importlib.util
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -123,6 +124,32 @@ class AchievementEngineTests(unittest.TestCase):
         )
         self.assertEqual(result["state"], "unlocked")
         self.assertEqual(result["tier"], "Copper")
+
+    def test_session_database_paths_include_root_and_profiles(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "state.db").touch()
+            (root / "profiles" / "router").mkdir(parents=True)
+            (root / "profiles" / "router" / "state.db").touch()
+            (root / "profiles" / "writing").mkdir()
+            (root / "profiles" / "writing" / "state.db").touch()
+            (root / "profiles" / "empty").mkdir()
+
+            original = plugin_api.get_process_hermes_home
+            setattr(plugin_api, "get_process_hermes_home", lambda: root)
+            try:
+                databases = plugin_api.session_database_paths()
+            finally:
+                setattr(plugin_api, "get_process_hermes_home", original)
+
+        self.assertEqual(
+            databases,
+            [
+                ("default", root / "state.db"),
+                ("router", root / "profiles" / "router" / "state.db"),
+                ("writing", root / "profiles" / "writing" / "state.db"),
+            ],
+        )
 
     def test_removed_noisy_achievements_are_not_in_catalog(self):
         ids = {achievement["id"] for achievement in plugin_api.ACHIEVEMENTS}

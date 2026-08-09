@@ -13,10 +13,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 try:
-    from hermes_constants import get_hermes_home
+    from hermes_constants import get_process_hermes_home
 except ImportError:
     import os as _os
-    def get_hermes_home() -> Path:  # type: ignore[misc]
+    def get_process_hermes_home() -> Path:  # type: ignore[misc]
         val = (_os.environ.get("HERMES_HOME") or "").strip()
         return Path(val) if val else Path.home() / ".hermes"
 
@@ -143,15 +143,15 @@ ACHIEVEMENTS: List[Dict[str, Any]] = [
 
 
 def state_path() -> Path:
-    return get_hermes_home() / "plugins" / "hermes-achievements" / "state.json"
+    return get_process_hermes_home() / "plugins" / "hermes-achievements" / "state.json"
 
 
 def snapshot_path() -> Path:
-    return get_hermes_home() / "plugins" / "hermes-achievements" / "scan_snapshot.json"
+    return get_process_hermes_home() / "plugins" / "hermes-achievements" / "scan_snapshot.json"
 
 
 def checkpoint_path() -> Path:
-    return get_hermes_home() / "plugins" / "hermes-achievements" / "scan_checkpoint.json"
+    return get_process_hermes_home() / "plugins" / "hermes-achievements" / "scan_checkpoint.json"
 
 
 def load_state() -> Dict[str, Any]:
@@ -229,6 +229,28 @@ def session_fingerprint(meta: Dict[str, Any]) -> Dict[str, Any]:
         "model": meta.get("model"),
         "title": meta.get("title") or meta.get("preview") or "Untitled",
     }
+
+
+def session_database_paths() -> List[tuple[str, Path]]:
+    """Return the dashboard home and every profile session database.
+
+    Achievements are personal dashboard history, not profile-local metrics.
+    Keep the root database as ``default`` and discover profile databases from
+    the dashboard process home. Missing databases are skipped so a newly made
+    profile does not make a scan fail.
+    """
+    home = get_process_hermes_home()
+    databases: List[tuple[str, Path]] = []
+    root_db = home / "state.db"
+    if root_db.exists():
+        databases.append(("default", root_db))
+    profiles_dir = home / "profiles"
+    if profiles_dir.is_dir():
+        for profile_dir in sorted(profiles_dir.iterdir(), key=lambda path: path.name):
+            db_path = profile_dir / "state.db"
+            if profile_dir.is_dir() and db_path.exists():
+                databases.append((profile_dir.name, db_path))
+    return databases
 
 
 def _cache_is_fresh(now: int) -> bool:
@@ -599,64 +621,75 @@ def scan_sessions(
     # requests a small sample (e.g. a smoke test).
     db_limit = -1 if (limit is None or limit <= 0) else int(limit)
 
-    db = SessionDB()
-    try:
-        sessions_meta = db.list_sessions_rich(limit=db_limit, include_children=True, project_compression_tips=False)
-        total_sessions = len(sessions_meta)
-        sessions: List[Dict[str, Any]] = []
-        checkpoint_sessions: Dict[str, Any] = {}
-        for idx, meta in enumerate(sessions_meta, start=1):
-            sid = meta.get("id")
-            if not sid:
-                continue
-            fp = session_fingerprint(meta)
-            cached = previous_sessions.get(sid) if isinstance(previous_sessions, dict) else None
-            cached_stats = cached.get("stats") if isinstance(cached, dict) else None
-            cached_fp = cached.get("fingerprint") if isinstance(cached, dict) else None
+    session_dbs = session_database_paths()
+    db_sessions: List[tuple[str, Path, List[Dict[str, Any]]]] = []
+    for profile, db_path in session_dbs:
+        db = SessionDB(db_path=db_path, read_only=True)
+        try:
+            db_sessions.append((profile, db_path, db.list_sessions_rich(limit=db_limit, include_children=True, project_compression_tips=False)))
+        finally:
+            db.close()
 
-            if isinstance(cached_stats, dict) and cached_fp == fp:
-                stats = dict(cached_stats)
-                reused += 1
-            else:
-                messages = db.get_messages(sid)
-                stats = analyze_messages(sid, meta.get("title") or meta.get("preview") or "Untitled", messages)
-                rescanned += 1
+    total_sessions = sum(len(sessions_meta) for _, _, sessions_meta in db_sessions)
+    sessions: List[Dict[str, Any]] = []
+    checkpoint_sessions: Dict[str, Any] = {}
+    processed = 0
+    for profile, db_path, sessions_meta in db_sessions:
+        db = SessionDB(db_path=db_path, read_only=True)
+        try:
+            for meta in sessions_meta:
+                processed += 1
+                sid = meta.get("id")
+                if not sid:
+                    continue
+                checkpoint_id = f"{profile}:{sid}"
+                fp = session_fingerprint(meta)
+                cached = previous_sessions.get(checkpoint_id) if isinstance(previous_sessions, dict) else None
+                cached_stats = cached.get("stats") if isinstance(cached, dict) else None
+                cached_fp = cached.get("fingerprint") if isinstance(cached, dict) else None
 
-            stats["session_id"] = sid
-            stats["title"] = meta.get("title") or meta.get("preview") or stats.get("title") or "Untitled"
-            stats["started_at"] = meta.get("started_at")
-            stats["last_active"] = meta.get("last_active")
-            stats["source"] = meta.get("source")
-            if meta.get("model"):
-                stats.setdefault("model_names", set())
-                if isinstance(stats["model_names"], set):
-                    stats["model_names"].add(str(meta.get("model")))
-                elif isinstance(stats["model_names"], list):
-                    if str(meta.get("model")) not in stats["model_names"]:
-                        stats["model_names"].append(str(meta.get("model")))
+                if isinstance(cached_stats, dict) and cached_fp == fp:
+                    stats = dict(cached_stats)
+                    reused += 1
                 else:
-                    stats["model_names"] = {str(meta.get("model"))}
+                    messages = db.get_messages(sid)
+                    stats = analyze_messages(checkpoint_id, meta.get("title") or meta.get("preview") or "Untitled", messages)
+                    rescanned += 1
 
-            sessions.append(stats)
-            checkpoint_sessions[sid] = {"fingerprint": fp, "stats": _json_safe(stats)}
+                stats["session_id"] = checkpoint_id
+                stats["profile"] = profile
+                stats["title"] = meta.get("title") or meta.get("preview") or stats.get("title") or "Untitled"
+                stats["started_at"] = meta.get("started_at")
+                stats["last_active"] = meta.get("last_active")
+                stats["source"] = meta.get("source")
+                if meta.get("model"):
+                    stats.setdefault("model_names", set())
+                    if isinstance(stats["model_names"], set):
+                        stats["model_names"].add(str(meta.get("model")))
+                    elif isinstance(stats["model_names"], list):
+                        if str(meta.get("model")) not in stats["model_names"]:
+                            stats["model_names"].append(str(meta.get("model")))
+                    else:
+                        stats["model_names"] = {str(meta.get("model"))}
 
-            if progress_callback is not None and progress_every > 0 and (idx % progress_every == 0) and idx < total_sessions:
-                try:
-                    progress_callback(list(sessions), idx, total_sessions)
-                except Exception:
-                    # Progress callbacks are advisory — a broken publisher
-                    # must never abort the scan itself.
-                    pass
+                sessions.append(stats)
+                checkpoint_sessions[checkpoint_id] = {"fingerprint": fp, "stats": _json_safe(stats)}
 
-        save_checkpoint({
-            "schema_version": 1,
-            "generated_at": int(time.time()),
-            "sessions": checkpoint_sessions,
-        })
-    finally:
-        close = getattr(db, "close", None)
-        if close:
-            close()
+                if progress_callback is not None and progress_every > 0 and (processed % progress_every == 0) and processed < total_sessions:
+                    try:
+                        progress_callback(list(sessions), processed, total_sessions)
+                    except Exception:
+                        # Progress callbacks are advisory — a broken publisher
+                        # must never abort the scan itself.
+                        pass
+        finally:
+            db.close()
+
+    save_checkpoint({
+        "schema_version": 1,
+        "generated_at": int(time.time()),
+        "sessions": checkpoint_sessions,
+    })
     return {
         "sessions": sessions,
         "aggregate": aggregate_stats(sessions),
